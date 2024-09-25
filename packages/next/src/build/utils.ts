@@ -97,6 +97,11 @@ import {
 } from '../lib/fallback'
 import { getParamKeys } from '../server/request/fallback-params'
 import type { OutgoingHttpHeaders } from 'http'
+import {
+  AppSegmentConfigSchema,
+  type AppSegmentConfig,
+} from './app-segment-config'
+import type { AppDirModules } from './webpack/loaders/next-app-loader'
 
 export type ROUTER_TYPE = 'pages' | 'app'
 
@@ -1121,7 +1126,7 @@ export async function buildStaticPaths({
           (!repeat && typeof paramValue !== 'string')
         ) {
           // If this is from app directory, and not all params were provided,
-          // then filter this out if the route is not PPR enabled.
+          // then filter this out.
           if (appDir && typeof paramValue === 'undefined') {
             builtPage = ''
             encodedBuiltPage = ''
@@ -1200,73 +1205,60 @@ export async function buildStaticPaths({
   }
 }
 
-export type AppConfigDynamic =
-  | 'auto'
-  | 'error'
-  | 'force-static'
-  | 'force-dynamic'
-
-export type AppConfig = {
-  revalidate?: number | false
-  dynamicParams?: true | false
-  dynamic?: AppConfigDynamic
-  fetchCache?: 'force-cache' | 'only-cache'
-  preferredRegion?: string
-
-  /**
-   * When true, the page will be served using partial prerendering.
-   * This setting will only take affect if it's enabled via
-   * the `experimental.ppr = "incremental"` option.
-   */
-  experimental_ppr?: boolean
-}
-
 type GenerateStaticParams = (options: { params?: Params }) => Promise<Params[]>
 
-type GenerateParamsResult = {
-  config?: AppConfig
+export type AppSegment = {
+  type?: keyof AppDirModules
+  name?: string
+  param?: string
+  path: string
+  filePath?: string
+  config: AppSegmentConfig | undefined
   isDynamicSegment?: boolean
-  segmentPath: string
   generateStaticParams?: GenerateStaticParams
-  isLayout?: boolean
 }
 
-export type GenerateParamsResults = GenerateParamsResult[]
-
-const collectAppConfig = (
-  mod: Partial<AppConfig> | undefined
-): AppConfig | undefined => {
-  let hasConfig = false
-  const config: AppConfig = {}
-
-  if (typeof mod?.revalidate !== 'undefined') {
-    config.revalidate = mod.revalidate
-    hasConfig = true
-  }
-  if (typeof mod?.dynamicParams !== 'undefined') {
-    config.dynamicParams = mod.dynamicParams
-    hasConfig = true
-  }
-  if (typeof mod?.dynamic !== 'undefined') {
-    config.dynamic = mod.dynamic
-    hasConfig = true
-  }
-  if (typeof mod?.fetchCache !== 'undefined') {
-    config.fetchCache = mod.fetchCache
-    hasConfig = true
-  }
-  if (typeof mod?.preferredRegion !== 'undefined') {
-    config.preferredRegion = mod.preferredRegion
-    hasConfig = true
-  }
-  if (typeof mod?.experimental_ppr !== 'undefined') {
-    config.experimental_ppr = mod.experimental_ppr
-    hasConfig = true
+/**
+ * Get the module from the components. This only returns the module if it is
+ * a page or layout.
+ *
+ * @param components - The components to get the module from.
+ * @returns The module and the type of module.
+ */
+async function getPageOrLayoutModule(
+  components: AppDirModules
+): Promise<{ mod?: any; type?: keyof AppDirModules }> {
+  if (typeof components.layout !== 'undefined') {
+    return { mod: await components.layout[0]?.(), type: 'layout' }
   }
 
-  if (!hasConfig) return undefined
+  if (typeof components.page !== 'undefined') {
+    return { mod: await components.page[0]?.(), type: 'page' }
+  }
 
-  return config
+  // Try to get the first module that is not undefined.
+  const type = Object.keys(components).find((key) => {
+    return typeof components[key as keyof AppDirModules] !== 'undefined'
+  }) as keyof AppDirModules | undefined
+
+  return { type }
+}
+
+const ModuleName: Record<keyof AppDirModules, string> = {
+  layout: 'Layout',
+  page: 'Page',
+  template: 'Template',
+  error: 'Error',
+  loading: 'Loading',
+  'not-found': 'Not Found',
+  metadata: 'Metadata',
+  defaultPage: 'Default Page',
+}
+
+function getModuleName(type: keyof AppDirModules | undefined) {
+  if (!type) return 'Component'
+
+  return ModuleName[type]
 }
 
 /**
@@ -1275,69 +1267,78 @@ const collectAppConfig = (
  * @param tree the loader tree
  * @returns the generate parameters for each segment
  */
-export async function collectGenerateParams(tree: LoaderTree) {
-  const generateParams: GenerateParamsResults = []
+export async function collectSegments(tree: LoaderTree) {
+  const segments: AppSegment[] = []
   const parentSegments: string[] = []
 
   let currentLoaderTree = tree
   while (currentLoaderTree) {
-    const [
-      // TODO: check if this is ever undefined
-      page = '',
-      parallelRoutes,
-      components,
-    ] = currentLoaderTree
+    const [name, parallelRoutes, components] = currentLoaderTree
 
-    // If the segment doesn't have any components, then skip it.
-    if (!components) continue
+    const { mod, type } = await getPageOrLayoutModule(components)
 
-    const isLayout = !!components.layout
-    const mod = await (isLayout
-      ? components.layout?.[0]?.()
-      : components.page?.[0]?.())
-
-    if (page) {
-      parentSegments.push(page)
+    if (name && (type === 'page' || type === 'layout')) {
+      parentSegments.push(name)
     }
 
-    const config = mod ? collectAppConfig(mod) : undefined
-    const isClientComponent = isClientReference(mod)
+    const isClientComponent = mod && isClientReference(mod)
+    const isDynamicSegment = /^\[.+\]$/.test(name)
+    const param = isDynamicSegment ? name.replace(/[[\].]|/g, '') : undefined
 
-    const isDynamicSegment = /^\[.+\]$/.test(page)
+    const parentResult =
+      segments.length > 0 ? segments[segments.length - 1] : undefined
 
-    const { generateStaticParams } = mod || {}
+    const filePath = `app/${[...parentSegments, type].join('/')}`
 
-    if (isDynamicSegment && isClientComponent && generateStaticParams) {
-      throw new Error(
-        `Page "${page}" cannot export "generateStaticParams()" because it is a client component`
-      )
-    }
-
-    const segmentPath = `/${parentSegments.join('/')}${
-      page && parentSegments.length > 0 ? '/' : ''
-    }${page}`
-
-    const result: GenerateParamsResult = {
-      isLayout,
+    const result: AppSegment = {
+      type,
+      name,
+      path: `/${parentSegments.join('/')}`,
+      param,
+      filePath,
+      config: undefined,
       isDynamicSegment,
-      segmentPath,
-      config,
-      generateStaticParams: !isClientComponent
-        ? generateStaticParams
-        : undefined,
     }
 
-    // If the configuration contributes to the static generation, then add it
-    // to the list.
-    if (result.config || result.generateStaticParams || isDynamicSegment) {
-      generateParams.push(result)
+    if (!isClientComponent && mod) {
+      const { generateStaticParams } = mod
+      if (typeof generateStaticParams === 'function') {
+        result.generateStaticParams = generateStaticParams
+      }
+
+      const config = AppSegmentConfigSchema.safeParse(mod)
+
+      // If parsing was successful and the config has some keys, then use it.
+      if (config.success && Object.keys(config.data).length > 0) {
+        result.config = config.data
+
+        if (
+          typeof result.config.dynamicParams === 'boolean' &&
+          !isDynamicSegment &&
+          (result.type === 'layout' ||
+            (result.type === 'page' && !parentResult?.isDynamicSegment))
+        ) {
+          throw new Error(
+            `${getModuleName(type)} "${filePath}" cannot export "dynamicParams" because it is not a dynamic segment`
+          )
+        }
+      }
     }
+
+    // Add the result to the generate params list.
+    segments.push(result)
 
     // Use this route's parallel route children as the next segment.
     currentLoaderTree = parallelRoutes.children
   }
 
-  return generateParams
+  // If the configuration contributes to the static generation, then add it
+  // to the list.
+  return segments.filter((result) => {
+    return (
+      result.config || result.generateStaticParams || result.isDynamicSegment
+    )
+  })
 }
 
 export type PartialStaticPathsResult = {
@@ -1349,7 +1350,7 @@ export async function buildAppStaticPaths({
   page,
   distDir,
   configFileName,
-  generateParams,
+  segments,
   isrFlushToDisk,
   cacheHandler,
   requestHeaders,
@@ -1363,7 +1364,7 @@ export async function buildAppStaticPaths({
   dir: string
   page: string
   configFileName: string
-  generateParams: GenerateParamsResults
+  segments: AppSegment[]
   distDir: string
   isrFlushToDisk?: boolean
   fetchCacheKeyPrefix?: string
@@ -1406,7 +1407,20 @@ export async function buildAppStaticPaths({
     minimalMode: ciEnvironment.hasNextSupport,
   })
 
-  return withStaticGenerationStore(
+  const paramKeys = new Set<string>()
+
+  const staticParamKeys = new Set<string>()
+  for (const segment of segments) {
+    if (segment.param) {
+      paramKeys.add(segment.param)
+
+      if (segment.config?.dynamicParams === false) {
+        staticParamKeys.add(segment.param)
+      }
+    }
+  }
+
+  const routeParams = await withStaticGenerationStore(
     ComponentMod.staticGenerationAsyncStorage,
     {
       page,
@@ -1423,134 +1437,144 @@ export async function buildAppStaticPaths({
         },
       },
     },
-    async (): Promise<PartialStaticPathsResult> => {
-      let hadAllParamsGenerated = false
-
-      const buildParams = async (
-        paramsItems: Params[] = [{}],
+    async (store) => {
+      async function builtRouteParams(
+        parentsParams: Params[] = [{}],
         idx = 0
-      ): Promise<Params[]> => {
-        const current = generateParams[idx]
+      ): Promise<Params[]> {
+        // If we don't have any more to process, then we're done.
+        if (idx === segments.length) return parentsParams
 
-        if (idx === generateParams.length) {
-          return paramsItems
-        }
+        const current = segments[idx]
 
         if (
           typeof current.generateStaticParams !== 'function' &&
-          idx < generateParams.length
+          idx < segments.length
         ) {
-          if (current.isDynamicSegment) {
-            // This dynamic level has no generateStaticParams so we change
-            // this flag to false, but it could be covered by a later
-            // generateStaticParams so it could be set back to true.
-            hadAllParamsGenerated = false
-          }
-          return buildParams(paramsItems, idx + 1)
+          return builtRouteParams(parentsParams, idx + 1)
         }
-        hadAllParamsGenerated = true
 
-        const newParams: Params[] = []
+        const params: Params[] = []
 
         if (current.generateStaticParams) {
-          const store = ComponentMod.staticGenerationAsyncStorage.getStore()
-
-          if (store) {
-            if (typeof current?.config?.fetchCache !== 'undefined') {
-              store.fetchCache = current.config.fetchCache
-            }
-            if (typeof current?.config?.revalidate !== 'undefined') {
-              store.revalidate = current.config.revalidate
-            }
-            if (current?.config?.dynamic === 'force-dynamic') {
-              store.forceDynamic = true
-            }
+          if (typeof current.config?.fetchCache !== 'undefined') {
+            store.fetchCache = current.config.fetchCache
+          }
+          if (typeof current.config?.revalidate !== 'undefined') {
+            store.revalidate = current.config.revalidate
+          }
+          if (current.config?.dynamic === 'force-dynamic') {
+            store.forceDynamic = true
           }
 
-          for (const params of paramsItems) {
+          for (const parentParams of parentsParams) {
             const result = await current.generateStaticParams({
-              params,
+              params: parentParams,
             })
 
-            // TODO: validate the result is valid here or wait for buildStaticPaths to validate?
             for (const item of result) {
-              newParams.push({ ...params, ...item })
+              params.push({ ...parentParams, ...item })
             }
           }
         }
 
-        if (idx < generateParams.length) {
-          return buildParams(newParams, idx + 1)
+        if (idx < segments.length) {
+          return builtRouteParams(params, idx + 1)
         }
 
-        return newParams
+        return params
       }
 
-      const builtParams = await buildParams()
-
-      if (
-        generateParams.some(
-          (generate) => generate.config?.dynamicParams === true
-        ) &&
-        nextConfigOutput === 'export'
-      ) {
-        throw new Error(
-          '"dynamicParams: true" cannot be used with "output: export". See more info here: https://nextjs.org/docs/app/building-your-application/deploying/static-exports'
-        )
-      }
-
-      // TODO: dynamic params should be allowed to be granular per segment but
-      // we need  additional information stored/leveraged in the prerender
-      // manifest to allow this behavior.
-      const dynamicParams = generateParams.every(
-        (param) => param.config?.dynamicParams !== false
-      )
-
-      const isProduction = process.env.NODE_ENV === 'production'
-
-      const supportsStaticGeneration = hadAllParamsGenerated || isProduction
-
-      const supportsPPRFallbacks = isRoutePPREnabled && isAppPPRFallbacksEnabled
-
-      const fallbackMode = dynamicParams
-        ? supportsStaticGeneration
-          ? supportsPPRFallbacks
-            ? FallbackMode.PRERENDER
-            : FallbackMode.BLOCKING_STATIC_RENDER
-          : undefined
-        : FallbackMode.NOT_FOUND
-
-      let result: PartialStaticPathsResult = {
-        fallbackMode,
-        prerenderedRoutes: undefined,
-      }
-
-      if (hadAllParamsGenerated && fallbackMode) {
-        result = await buildStaticPaths({
-          staticPathsResult: {
-            fallback: fallbackModeToStaticPathsResult(fallbackMode),
-            paths: builtParams.map((params) => ({ params })),
-          },
-          page,
-          configFileName,
-          appDir: true,
-        })
-      }
-
-      // If the fallback mode is a prerender, we want to include the dynamic
-      // route in the prerendered routes too.
-      if (isRoutePPREnabled && isAppPPRFallbacksEnabled) {
-        result.prerenderedRoutes ??= []
-        result.prerenderedRoutes.unshift({
-          path: page,
-          encoded: page,
-          fallbackRouteParams: getParamKeys(page),
-        })
-      }
-
-      return result
+      return builtRouteParams()
     }
   )
+
+  if (
+    segments.some((generate) => generate.config?.dynamicParams === true) &&
+    nextConfigOutput === 'export'
+  ) {
+    throw new Error(
+      '"dynamicParams: true" cannot be used with "output: export". See more info here: https://nextjs.org/docs/app/building-your-application/deploying/static-exports'
+    )
+  }
+
+  for (const segment of segments) {
+    // We're doing validation on dynamic param segments, so skip non-dynamic
+    // segments.
+    if (!segment.param || !segment.isDynamicSegment) continue
+
+    // We found a segment that defines dynamicParams as false. We should check
+    // to see if the generated route params include this in all cases.
+    if (segment.config?.dynamicParams === false) {
+      for (const params of routeParams) {
+        if (segment.param in params) continue
+
+        throw new Error(
+          `${getModuleName(segment.type)} "${segment.filePath}" exports "dynamicParams: false" but the param "${segment.param}" is missing from the generated route params.`
+        )
+      }
+    }
+  }
+
+  // Determine if all the segments have had their parameters provided.
+  const hadAllParamsGenerated = routeParams.every((params) => {
+    for (const key of paramKeys) {
+      if (key in params) continue
+      return false
+    }
+    return true
+  })
+
+  // TODO: dynamic params should be allowed to be granular per segment but
+  // we need  additional information stored/leveraged in the prerender
+  // manifest to allow this behavior.
+  const dynamicParams = segments.every(
+    (param) => param.config?.dynamicParams !== false
+  )
+
+  const isProduction = process.env.NODE_ENV === 'production'
+
+  const supportsRoutePregeneration = hadAllParamsGenerated || isProduction
+
+  const supportsPPRFallbacks = isRoutePPREnabled && isAppPPRFallbacksEnabled
+
+  const fallbackMode = dynamicParams
+    ? supportsRoutePregeneration
+      ? supportsPPRFallbacks
+        ? FallbackMode.PRERENDER
+        : FallbackMode.BLOCKING_STATIC_RENDER
+      : undefined
+    : FallbackMode.NOT_FOUND
+
+  let result: PartialStaticPathsResult = {
+    fallbackMode,
+    prerenderedRoutes: undefined,
+  }
+
+  if (hadAllParamsGenerated && fallbackMode) {
+    result = await buildStaticPaths({
+      staticPathsResult: {
+        fallback: fallbackModeToStaticPathsResult(fallbackMode),
+        paths: routeParams.map((params) => ({ params })),
+      },
+      page,
+      configFileName,
+      appDir: true,
+    })
+  }
+
+  // If the fallback mode is a prerender, we want to include the dynamic
+  // route in the prerendered routes too.
+  if (isRoutePPREnabled && isAppPPRFallbacksEnabled) {
+    result.prerenderedRoutes ??= []
+    result.prerenderedRoutes.unshift({
+      path: page,
+      encoded: page,
+      fallbackRouteParams: getParamKeys(page),
+    })
+  }
+
+  return result
 }
 
 type PageIsStaticResult = {
@@ -1565,7 +1589,7 @@ type PageIsStaticResult = {
   isNextImageImported?: boolean
   traceIncludes?: string[]
   traceExcludes?: string[]
-  appConfig?: AppConfig
+  appConfig?: AppSegmentConfig
 }
 
 export async function isPageStatic({
@@ -1622,7 +1646,7 @@ export async function isPageStatic({
       let componentsResult: LoadComponentsReturnType
       let prerenderedRoutes: PrerenderedRoute[] | undefined
       let prerenderFallbackMode: FallbackMode | undefined
-      let appConfig: AppConfig = {}
+      let appConfig: AppSegmentConfig = {}
       let isClientComponent: boolean = false
       const pathIsEdgeRuntime = isEdgeRuntime(pageRuntime)
 
@@ -1678,7 +1702,7 @@ export async function isPageStatic({
 
         const { tree } = ComponentMod
 
-        const generateParams: GenerateParamsResults =
+        const generateParams: AppSegment[] =
           routeModule && isAppRouteRouteModule(routeModule)
             ? [
                 {
@@ -1689,10 +1713,10 @@ export async function isPageStatic({
                   },
                   generateStaticParams:
                     routeModule.userland.generateStaticParams,
-                  segmentPath: page,
+                  path: page,
                 },
               ]
-            : await collectGenerateParams(tree)
+            : await collectSegments(tree)
 
         appConfig = reduceAppConfig(generateParams)
 
@@ -1723,7 +1747,7 @@ export async function isPageStatic({
               dir,
               page,
               configFileName,
-              generateParams,
+              segments: generateParams,
               distDir,
               requestHeaders: {},
               isrFlushToDisk,
@@ -1827,7 +1851,7 @@ export async function isPageStatic({
 }
 
 type ReducedAppConfig = Pick<
-  AppConfig,
+  AppSegmentConfig,
   | 'dynamic'
   | 'fetchCache'
   | 'preferredRegion'
@@ -1842,9 +1866,7 @@ type ReducedAppConfig = Pick<
  * @param segments the generate param segments
  * @returns the reduced app config
  */
-export function reduceAppConfig(
-  segments: GenerateParamsResults
-): ReducedAppConfig {
+export function reduceAppConfig(segments: AppSegment[]): ReducedAppConfig {
   const config: ReducedAppConfig = {}
 
   for (const segment of segments) {

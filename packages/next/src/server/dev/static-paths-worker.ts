@@ -6,13 +6,10 @@ import '../node-environment'
 import {
   buildAppStaticPaths,
   buildStaticPaths,
-  collectGenerateParams,
+  collectSegments,
   reduceAppConfig,
 } from '../../build/utils'
-import type {
-  GenerateParamsResults,
-  PartialStaticPathsResult,
-} from '../../build/utils'
+import type { AppSegment, PartialStaticPathsResult } from '../../build/utils'
 import { loadComponents } from '../load-components'
 import { setHttpClientAndAgentOptions } from '../setup-http-agent-env'
 import type { IncrementalCache } from '../lib/incremental-cache'
@@ -93,7 +90,7 @@ export async function loadStaticPaths({
 
   if (isAppPath) {
     const { routeModule } = components
-    const generateParams: GenerateParamsResults =
+    const segments: AppSegment[] =
       routeModule && isAppRouteRouteModule(routeModule)
         ? [
             {
@@ -103,19 +100,19 @@ export async function loadStaticPaths({
                 dynamicParams: routeModule.userland.dynamicParams,
               },
               generateStaticParams: routeModule.userland.generateStaticParams,
-              segmentPath: pathname,
+              path: pathname,
             },
           ]
-        : await collectGenerateParams(components.ComponentMod.tree)
+        : await collectSegments(components.ComponentMod.tree)
 
     const isRoutePPREnabled =
       isAppPageRouteModule(routeModule) &&
-      checkIsRoutePPREnabled(config.pprConfig, reduceAppConfig(generateParams))
+      checkIsRoutePPREnabled(config.pprConfig, reduceAppConfig(segments))
 
     return await buildAppStaticPaths({
       dir,
       page: pathname,
-      generateParams,
+      segments,
       configFileName: config.configFileName,
       distDir,
       requestHeaders,
