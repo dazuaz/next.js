@@ -101,6 +101,7 @@ import {
   AppSegmentConfigSchema,
   type AppSegmentConfig,
 } from './app-segment-config'
+import { normalizeZodErrors } from '../shared/lib/zod'
 import type { AppDirModules } from './webpack/loaders/next-app-loader'
 
 export type ROUTER_TYPE = 'pages' | 'app'
@@ -1309,19 +1310,30 @@ export async function collectSegments(tree: LoaderTree) {
       const config = AppSegmentConfigSchema.safeParse(mod)
 
       // If parsing was successful and the config has some keys, then use it.
-      if (config.success && Object.keys(config.data).length > 0) {
-        result.config = config.data
+      if (config.success) {
+        // Only set the config if there are keys to set.
+        if (Object.keys(config.data).length > 0) {
+          result.config = config.data
 
-        if (
-          typeof result.config.dynamicParams === 'boolean' &&
-          !isDynamicSegment &&
-          (result.type === 'layout' ||
-            (result.type === 'page' && !parentResult?.isDynamicSegment))
-        ) {
-          throw new Error(
-            `${getModuleName(type)} "${filePath}" cannot export "dynamicParams" because it is not a dynamic segment`
-          )
+          if (
+            typeof result.config.dynamicParams === 'boolean' &&
+            !isDynamicSegment &&
+            (result.type === 'layout' ||
+              (result.type === 'page' && !parentResult?.isDynamicSegment))
+          ) {
+            throw new Error(
+              `${getModuleName(type)} "${filePath}" cannot export "dynamicParams" because it is not a dynamic segment`
+            )
+          }
         }
+      } else {
+        const messages = [
+          `Invalid segment configuration options detected for ${getModuleName(type)} "${result.filePath}": `,
+        ]
+        for (const { message } of normalizeZodErrors(config.error)) {
+          messages.push(`    ${message}`)
+        }
+        throw new Error(messages.join('\n'))
       }
     }
 
