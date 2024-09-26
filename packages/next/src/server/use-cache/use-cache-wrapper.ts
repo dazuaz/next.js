@@ -15,6 +15,8 @@ import {
 import type { StaticGenerationStore } from '../../client/components/static-generation-async-storage.external'
 import { staticGenerationAsyncStorage } from '../../client/components/static-generation-async-storage.external'
 
+import { getClientReferenceManifestSingleton } from '../app-render/encryption-utils'
+
 type CacheEntry = {
   value: ReadableStream
   stale: boolean
@@ -65,10 +67,6 @@ cacheHandlerMap.set('default', {
 
 const serverManifest: any = null // TODO
 const clientManifest: any = null // TODO
-const ssrManifest: any = {
-  moduleMap: {},
-  moduleLoading: null,
-} // TODO
 
 // TODO: Consider moving this another module that is guaranteed to be required in a safe scope.
 const runInCleanSnapshot = createSnapshot()
@@ -91,18 +89,22 @@ async function generateCacheEntry(
   let didError = false
   let firstError: any = null
 
-  const stream = renderToReadableStream(result, clientManifest, {
-    environmentName: 'Cache',
-    temporaryReferences,
-    onError(error: any) {
-      // Report the error.
-      console.error(error)
-      if (!didError) {
-        didError = true
-        firstError = error
-      }
-    },
-  })
+  const stream = renderToReadableStream(
+    result,
+    getClientReferenceManifestSingleton().clientModules,
+    {
+      environmentName: 'Cache',
+      temporaryReferences,
+      onError(error: any) {
+        // Report the error.
+        console.error(error)
+        if (!didError) {
+          didError = true
+          firstError = error
+        }
+      },
+    }
+  )
 
   const [returnStream, savedStream] = stream.tee()
 
@@ -235,6 +237,12 @@ export function cache(kind: string, id: string, fn: any) {
       // server terminal. Once while generating the cache entry and once when replaying it on
       // the server, which is required to pick it up for replaying again on the client.
       const replayConsoleLogs = true
+
+      const ssrManifest: any = {
+        moduleMap: getClientReferenceManifestSingleton().rscModuleMapping,
+        moduleLoading: null,
+      } // TODO
+
       return createFromReadableStream(stream, {
         ssrManifest,
         temporaryReferences,
