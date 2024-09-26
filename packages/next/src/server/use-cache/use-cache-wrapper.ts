@@ -15,7 +15,12 @@ import {
 import type { StaticGenerationStore } from '../../client/components/static-generation-async-storage.external'
 import { staticGenerationAsyncStorage } from '../../client/components/static-generation-async-storage.external'
 
-import { getClientReferenceManifestSingleton } from '../app-render/encryption-utils'
+import {
+  getClientReferenceManifestSingleton,
+  getServerModuleMap,
+} from '../app-render/encryption-utils'
+
+import type { ManifestNode } from '../../build/webpack/plugins/flight-manifest-plugin'
 
 type CacheEntry = {
   value: ReadableStream
@@ -79,9 +84,14 @@ async function generateCacheEntry(
   fn: any
 ): Promise<ReadableStream> {
   const temporaryReferences = createServerTemporaryReferenceSet()
-  const [, args] = await decodeReply<any[]>(encodedArguments, serverManifest, {
-    temporaryReferences,
-  })
+
+  const [, args] = await decodeReply<any[]>(
+    encodedArguments,
+    getServerModuleMap(),
+    {
+      temporaryReferences,
+    }
+  )
 
   // Invoke the inner function to load a new result.
   const result = fn.apply(null, args)
@@ -89,9 +99,11 @@ async function generateCacheEntry(
   let didError = false
   let firstError: any = null
 
+  const clientReferenceManifestSingleton = getClientReferenceManifestSingleton()
+
   const stream = renderToReadableStream(
     result,
-    getClientReferenceManifestSingleton().clientModules,
+    clientReferenceManifestSingleton.clientModules,
     {
       environmentName: 'Cache',
       temporaryReferences,
@@ -238,11 +250,21 @@ export function cache(kind: string, id: string, fn: any) {
       // the server, which is required to pick it up for replaying again on the client.
       const replayConsoleLogs = true
 
-      const ssrManifest: any = {
-        moduleMap: getClientReferenceManifestSingleton().rscModuleMapping,
-        moduleLoading: null,
-      } // TODO
+      // TODO: We can't use the client reference manifest to resolve the modules
+      // on the server side - instead they need to be recovered as the module
+      // references (proxies) again.
+      // For now, we'll just use an empty module map.
+      // const ssrModuleMap: {
+      //   [moduleExport: string]: ManifestNode
+      // } = {}
 
+      const ssrManifest = {
+        // moduleLoading must be null because we don't want to trigger preloads of ClientReferences
+        // to be added to the consumer. Instead, we'll wait for any ClientReference to be emitted
+        // which themselves will handle the preloading.
+        moduleLoading: null,
+        moduleMap: getClientReferenceManifestSingleton().rscModuleMapping,
+      }
       return createFromReadableStream(stream, {
         ssrManifest,
         temporaryReferences,

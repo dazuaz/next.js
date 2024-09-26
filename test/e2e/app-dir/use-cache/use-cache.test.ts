@@ -10,14 +10,17 @@ describe('use-cache', () => {
     const browser = await next.browser('/?n=1')
     expect(await browser.waitForElementByCss('#x').text()).toBe('1')
     const random1a = await browser.waitForElementByCss('#y').text()
+    expect(await browser.waitForElementByCss('#z').text()).toBe('foo')
 
     await browser.loadPage(new URL('/?n=2', next.url).toString())
     expect(await browser.waitForElementByCss('#x').text()).toBe('2')
     const random2 = await browser.waitForElementByCss('#y').text()
+    expect(await browser.waitForElementByCss('#z').text()).toBe('foo')
 
     await browser.loadPage(new URL('/?n=1&unrelated', next.url).toString())
     expect(await browser.waitForElementByCss('#x').text()).toBe('1')
     const random1b = await browser.waitForElementByCss('#y').text()
+    expect(await browser.waitForElementByCss('#z').text()).toBe('foo')
 
     // The two navigations to n=1 should use a cached value.
     expect(random1a).toBe(random1b)
